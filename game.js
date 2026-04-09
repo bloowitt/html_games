@@ -18,8 +18,8 @@ const player = {
   worldY: 0,
   velocityX: 0,
   velocityY: 0,
-  angle: -Math.PI / 2,
-  radius: 22,
+  angle: PLAYER_START_ANGLE,
+  radius: 16,
   thrust: 700,
   rotationSpeed: 3.3,
   maxSpeed: 1800,
@@ -37,11 +37,286 @@ const PLANET_CHUNK_SIZE = 2400;
 const PLANET_CHUNK_RADIUS = 2;
 const PLANET_MIN_PER_CHUNK = 1;
 const PLANET_MAX_PER_CHUNK = 3;
-const PLANET_GRAVITY_CONSTANT = 8000;
+const PLANET_GRAVITY_CONSTANT = 5000;
 const PLANET_COLORS = ['#79d3ff', '#ffd166', '#ef476f', '#7bd389', '#b794f4'];
+
+const MINIMAP_WIDTH = 250;
+const MINIMAP_MARGIN = 16;
+const MINIMAP_RANGE = 3600;
+
+const MISSILE_SPEED = 1300;
+const MISSILE_RADIUS = 3;
+const MISSILE_LIFETIME = 7;
+const MISSILE_GRAVITY_MULTIPLIER = 1.8;
+
+const TARGET_SIZE = 36;
+const TARGET_MIN_DISTANCE = 1400;
+const TARGET_MAX_DISTANCE = 4200;
+const TARGET_ARROW_SIZE = 14;
+
+const INITIAL_LIVES = 3;
+const BOOST_MAX_CHARGES = 5;
+const BOOST_DURATION = 4;
+
 let starsByLayer = [];
 const planetChunks = new Map();
+const missiles = [];
+let target = null;
+let destroyedTargets = 0;
+let lives = INITIAL_LIVES;
+let boostCharges = BOOST_MAX_CHARGES;
+let boostTimeRemaining = 0;
 let lastTime = 0;
+
+let audioCtx = null;
+let thrustNoise = null;
+let thrustFilter = null;
+let thrustGain = null;
+let thrustLfo = null;
+let thrustLfoGain = null;
+let thrustSoundActive = false;
+let boostOsc = null;
+let boostGain = null;
+let boostLfo = null;
+let boostLfoGain = null;
+let boostSoundActive = false;
+
+function ensureAudioContext() {
+  if (!audioCtx) {
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx) {
+      return null;
+    }
+    audioCtx = new AudioCtx();
+  }
+
+  if (audioCtx.state === 'suspended') {
+    audioCtx.resume();
+  }
+
+  return audioCtx;
+}
+
+function createNoiseSource(context) {
+  const bufferSize = context.sampleRate;
+  const buffer = context.createBuffer(1, bufferSize, context.sampleRate);
+  const data = buffer.getChannelData(0);
+
+  for (let i = 0; i < bufferSize; i += 1) {
+    data[i] = Math.random() * 2 - 1;
+  }
+
+  const source = context.createBufferSource();
+  source.buffer = buffer;
+  source.loop = true;
+  return source;
+}
+
+function startThrustSound() {
+  if (thrustSoundActive) {
+    return;
+  }
+
+  const context = ensureAudioContext();
+  if (!context) {
+    return;
+  }
+
+  thrustNoise = createNoiseSource(context);
+  thrustFilter = context.createBiquadFilter();
+  thrustFilter.type = 'bandpass';
+  thrustFilter.frequency.value = 1200;
+  thrustFilter.Q.value = 0.9;
+
+  thrustGain = context.createGain();
+  thrustGain.gain.value = 0.0001;
+
+  thrustLfo = context.createOscillator();
+  thrustLfo.type = 'triangle';
+  thrustLfo.frequency.value = 16;
+  thrustLfoGain = context.createGain();
+  thrustLfoGain.gain.value = 220;
+
+  thrustLfo.connect(thrustLfoGain);
+  thrustLfoGain.connect(thrustFilter.frequency);
+  thrustNoise.connect(thrustFilter);
+  thrustFilter.connect(thrustGain);
+  thrustGain.connect(context.destination);
+
+  const now = context.currentTime;
+  thrustGain.gain.setValueAtTime(0.0001, now);
+  thrustGain.gain.exponentialRampToValueAtTime(0.07, now + 0.05);
+
+  thrustNoise.start();
+  thrustLfo.start();
+  thrustSoundActive = true;
+}
+
+function stopThrustSound() {
+  if (!thrustSoundActive || !audioCtx) {
+    return;
+  }
+
+  const now = audioCtx.currentTime;
+  thrustGain.gain.cancelScheduledValues(now);
+  thrustGain.gain.setValueAtTime(Math.max(0.0001, thrustGain.gain.value), now);
+  thrustGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.08);
+
+  const noiseNode = thrustNoise;
+  const lfoNode = thrustLfo;
+  setTimeout(() => {
+    if (noiseNode) {
+      noiseNode.stop();
+      noiseNode.disconnect();
+    }
+    if (lfoNode) {
+      lfoNode.stop();
+      lfoNode.disconnect();
+    }
+  }, 120);
+
+  if (thrustFilter) {
+    thrustFilter.disconnect();
+  }
+  if (thrustGain) {
+    thrustGain.disconnect();
+  }
+  if (thrustLfoGain) {
+    thrustLfoGain.disconnect();
+  }
+
+  thrustNoise = null;
+  thrustFilter = null;
+  thrustGain = null;
+  thrustLfo = null;
+  thrustLfoGain = null;
+  thrustSoundActive = false;
+}
+
+function startBoostSound() {
+  if (boostSoundActive) {
+    return;
+  }
+
+  const context = ensureAudioContext();
+  if (!context) {
+    return;
+  }
+
+  boostOsc = context.createOscillator();
+  boostOsc.type = 'sawtooth';
+  boostOsc.frequency.value = 180;
+
+  boostGain = context.createGain();
+  boostGain.gain.value = 0.0001;
+
+  boostLfo = context.createOscillator();
+  boostLfo.type = 'sine';
+  boostLfo.frequency.value = 9;
+  boostLfoGain = context.createGain();
+  boostLfoGain.gain.value = 38;
+
+  boostLfo.connect(boostLfoGain);
+  boostLfoGain.connect(boostOsc.frequency);
+  boostOsc.connect(boostGain);
+  boostGain.connect(context.destination);
+
+  const now = context.currentTime;
+  boostGain.gain.setValueAtTime(0.0001, now);
+  boostGain.gain.exponentialRampToValueAtTime(0.06, now + 0.06);
+
+  boostOsc.start();
+  boostLfo.start();
+  boostSoundActive = true;
+}
+
+function stopBoostSound() {
+  if (!boostSoundActive || !audioCtx) {
+    return;
+  }
+
+  const now = audioCtx.currentTime;
+  boostGain.gain.cancelScheduledValues(now);
+  boostGain.gain.setValueAtTime(Math.max(0.0001, boostGain.gain.value), now);
+  boostGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.1);
+
+  const oscNode = boostOsc;
+  const lfoNode = boostLfo;
+  setTimeout(() => {
+    if (oscNode) {
+      oscNode.stop();
+      oscNode.disconnect();
+    }
+    if (lfoNode) {
+      lfoNode.stop();
+      lfoNode.disconnect();
+    }
+  }, 140);
+
+  if (boostGain) {
+    boostGain.disconnect();
+  }
+  if (boostLfoGain) {
+    boostLfoGain.disconnect();
+  }
+
+  boostOsc = null;
+  boostGain = null;
+  boostLfo = null;
+  boostLfoGain = null;
+  boostSoundActive = false;
+}
+
+function playShootSound() {
+  const context = ensureAudioContext();
+  if (!context) {
+    return;
+  }
+
+  const now = context.currentTime;
+
+  const laserOsc = context.createOscillator();
+  laserOsc.type = 'square';
+  laserOsc.frequency.setValueAtTime(1400, now);
+  laserOsc.frequency.exponentialRampToValueAtTime(360, now + 0.09);
+
+  const laserGain = context.createGain();
+  laserGain.gain.setValueAtTime(0.001, now);
+  laserGain.gain.exponentialRampToValueAtTime(0.11, now + 0.005);
+  laserGain.gain.exponentialRampToValueAtTime(0.001, now + 0.12);
+
+  const noiseSource = createNoiseSource(context);
+  const noiseFilter = context.createBiquadFilter();
+  noiseFilter.type = 'highpass';
+  noiseFilter.frequency.value = 1800;
+
+  const noiseGain = context.createGain();
+  noiseGain.gain.setValueAtTime(0.0001, now);
+  noiseGain.gain.exponentialRampToValueAtTime(0.04, now + 0.002);
+  noiseGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.04);
+
+  laserOsc.connect(laserGain);
+  laserGain.connect(context.destination);
+  noiseSource.connect(noiseFilter);
+  noiseFilter.connect(noiseGain);
+  noiseGain.connect(context.destination);
+
+  laserOsc.start(now);
+  laserOsc.stop(now + 0.14);
+  noiseSource.start(now);
+  noiseSource.stop(now + 0.05);
+
+  laserOsc.onended = () => {
+    laserOsc.disconnect();
+    laserGain.disconnect();
+  };
+
+  noiseSource.onended = () => {
+    noiseSource.disconnect();
+    noiseFilter.disconnect();
+    noiseGain.disconnect();
+  };
+}
 
 function resizeCanvas() {
   canvas.width = window.innerWidth;
@@ -62,7 +337,7 @@ function randomFromSeed(seed) {
   return Math.abs(Math.sin(seed * 12.9898 + 78.233) * 43758.5453) % 1;
 }
 
-    angle: PLAYER_START_ANGLE,
+function chunkKey(chunkX, chunkY) {
   return `${chunkX},${chunkY}`;
 }
 
@@ -83,7 +358,6 @@ function createPlanetForChunk(chunkX, chunkY, planetIndex) {
     color: PLANET_COLORS[colorIndex],
   };
 }
-  const PLAYER_START_ANGLE = -Math.PI / 2;
 
 function getPlanetsInChunk(chunkX, chunkY) {
   const key = chunkKey(chunkX, chunkY);
@@ -107,13 +381,13 @@ function getPlanetsInChunk(chunkX, chunkY) {
   return planets;
 }
 
-function getNearbyPlanets() {
-  const centerChunkX = Math.floor(player.worldX / PLANET_CHUNK_SIZE);
-  const centerChunkY = Math.floor(player.worldY / PLANET_CHUNK_SIZE);
+function getPlanetsAround(worldX, worldY, chunkRadius) {
+  const centerChunkX = Math.floor(worldX / PLANET_CHUNK_SIZE);
+  const centerChunkY = Math.floor(worldY / PLANET_CHUNK_SIZE);
   const nearby = [];
 
-  for (let chunkY = centerChunkY - PLANET_CHUNK_RADIUS; chunkY <= centerChunkY + PLANET_CHUNK_RADIUS; chunkY += 1) {
-    for (let chunkX = centerChunkX - PLANET_CHUNK_RADIUS; chunkX <= centerChunkX + PLANET_CHUNK_RADIUS; chunkX += 1) {
+  for (let chunkY = centerChunkY - chunkRadius; chunkY <= centerChunkY + chunkRadius; chunkY += 1) {
+    for (let chunkX = centerChunkX - chunkRadius; chunkX <= centerChunkX + chunkRadius; chunkX += 1) {
       nearby.push(...getPlanetsInChunk(chunkX, chunkY));
     }
   }
@@ -121,17 +395,21 @@ function getNearbyPlanets() {
   return nearby;
 }
 
-function applyPlanetGravity(deltaTime) {
-  const planets = getNearbyPlanets();
+function getNearbyPlanets() {
+  return getPlanetsAround(player.worldX, player.worldY, PLANET_CHUNK_RADIUS);
+}
+
+function getGravityAcceleration(worldX, worldY, bodyRadius) {
+  const planets = getPlanetsAround(worldX, worldY, PLANET_CHUNK_RADIUS);
   let accelerationX = 0;
   let accelerationY = 0;
 
   for (let i = 0; i < planets.length; i += 1) {
     const planet = planets[i];
-    const dx = planet.x - player.worldX;
-    const dy = planet.y - player.worldY;
+    const dx = planet.x - worldX;
+    const dy = planet.y - worldY;
     const distanceSq = dx * dx + dy * dy;
-    const minDistance = planet.radius + player.radius * 0.8;
+    const minDistance = planet.radius + bodyRadius * 0.8;
     const minDistanceSq = minDistance * minDistance;
     const clampedDistanceSq = Math.max(distanceSq, minDistanceSq);
     const distance = Math.sqrt(clampedDistanceSq);
@@ -141,8 +419,246 @@ function applyPlanetGravity(deltaTime) {
     accelerationY += (dy / distance) * accelerationMagnitude;
   }
 
-  player.velocityX += accelerationX * deltaTime;
-  player.velocityY += accelerationY * deltaTime;
+  return { x: accelerationX, y: accelerationY };
+}
+
+function applyPlanetGravity(deltaTime) {
+  const acceleration = getGravityAcceleration(player.worldX, player.worldY, player.radius);
+  player.velocityX += acceleration.x * deltaTime;
+  player.velocityY += acceleration.y * deltaTime;
+}
+
+function hasPlanetCollisionAt(worldX, worldY, bodyRadius) {
+  const planets = getPlanetsAround(worldX, worldY, PLANET_CHUNK_RADIUS);
+
+  for (let i = 0; i < planets.length; i += 1) {
+    const planet = planets[i];
+    const dx = planet.x - worldX;
+    const dy = planet.y - worldY;
+    const collisionDistance = planet.radius + bodyRadius;
+
+    if (dx * dx + dy * dy <= collisionDistance * collisionDistance) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function hasPlanetCollision() {
+  return hasPlanetCollisionAt(player.worldX, player.worldY, player.radius);
+}
+
+function resetPlayerState() {
+  player.worldX = 0;
+  player.worldY = 0;
+  player.velocityX = 0;
+  player.velocityY = 0;
+  player.angle = PLAYER_START_ANGLE;
+
+  input.up = false;
+  input.left = false;
+  input.right = false;
+  boostTimeRemaining = 0;
+
+  stopThrustSound();
+  stopBoostSound();
+}
+
+function resetGame() {
+  lives = INITIAL_LIVES;
+  destroyedTargets = 0;
+  boostCharges = BOOST_MAX_CHARGES;
+
+  resetPlayerState();
+  missiles.length = 0;
+
+  initStars();
+  spawnTarget();
+}
+
+function onPlayerPlanetCollision() {
+  lives -= 1;
+
+  if (lives <= 0) {
+    resetGame();
+    return;
+  }
+
+  resetPlayerState();
+}
+
+function activateBoost() {
+  if (boostCharges <= 0 || boostTimeRemaining > 0) {
+    return;
+  }
+
+  boostCharges -= 1;
+  boostTimeRemaining = BOOST_DURATION;
+}
+
+function targetOverlapsPlanet(worldX, worldY, targetSize) {
+  const planets = getPlanetsAround(worldX, worldY, 1);
+  const targetRadius = targetSize / 2;
+
+  for (let i = 0; i < planets.length; i += 1) {
+    const planet = planets[i];
+    const dx = planet.x - worldX;
+    const dy = planet.y - worldY;
+    const minDistance = planet.radius + targetRadius;
+
+    if (dx * dx + dy * dy <= minDistance * minDistance) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function spawnTarget() {
+  for (let attempt = 0; attempt < 120; attempt += 1) {
+    const angle = Math.random() * Math.PI * 2;
+    const distance = randomRange(TARGET_MIN_DISTANCE, TARGET_MAX_DISTANCE);
+    const x = player.worldX + Math.cos(angle) * distance;
+    const y = player.worldY + Math.sin(angle) * distance;
+
+    if (targetOverlapsPlanet(x, y, TARGET_SIZE)) {
+      continue;
+    }
+
+    target = { x, y, size: TARGET_SIZE };
+    return;
+  }
+
+  target = { x: player.worldX + TARGET_MAX_DISTANCE, y: player.worldY, size: TARGET_SIZE };
+}
+
+function onTargetDestroyed() {
+  destroyedTargets += 1;
+
+  if (destroyedTargets % 2 === 0) {
+    boostCharges = Math.min(BOOST_MAX_CHARGES, boostCharges + 1);
+  }
+
+  spawnTarget();
+}
+
+function missileHitsTarget(missile) {
+  if (!target) {
+    return false;
+  }
+
+  const halfSize = target.size / 2;
+  const nearestX = Math.max(target.x - halfSize, Math.min(missile.worldX, target.x + halfSize));
+  const nearestY = Math.max(target.y - halfSize, Math.min(missile.worldY, target.y + halfSize));
+  const dx = missile.worldX - nearestX;
+  const dy = missile.worldY - nearestY;
+
+  return dx * dx + dy * dy <= missile.radius * missile.radius;
+}
+
+function shootMissile() {
+  playShootSound();
+
+  const noseDistance = player.radius * 1.28;
+  const spawnX = player.worldX + Math.cos(player.angle) * noseDistance;
+  const spawnY = player.worldY + Math.sin(player.angle) * noseDistance;
+
+  missiles.push({
+    worldX: spawnX,
+    worldY: spawnY,
+    velocityX: player.velocityX + Math.cos(player.angle) * MISSILE_SPEED,
+    velocityY: player.velocityY + Math.sin(player.angle) * MISSILE_SPEED,
+    radius: MISSILE_RADIUS,
+    life: MISSILE_LIFETIME,
+  });
+}
+
+function updateMissiles(deltaTime) {
+  for (let i = missiles.length - 1; i >= 0; i -= 1) {
+    const missile = missiles[i];
+    const acceleration = getGravityAcceleration(missile.worldX, missile.worldY, missile.radius);
+
+    missile.velocityX += acceleration.x * MISSILE_GRAVITY_MULTIPLIER * deltaTime;
+    missile.velocityY += acceleration.y * MISSILE_GRAVITY_MULTIPLIER * deltaTime;
+    missile.worldX += missile.velocityX * deltaTime;
+    missile.worldY += missile.velocityY * deltaTime;
+    missile.life -= deltaTime;
+
+    if (missileHitsTarget(missile)) {
+      missiles.splice(i, 1);
+      onTargetDestroyed();
+      continue;
+    }
+
+    if (missile.life <= 0 || hasPlanetCollisionAt(missile.worldX, missile.worldY, missile.radius)) {
+      missiles.splice(i, 1);
+    }
+  }
+}
+
+function renderTarget(centerX, centerY) {
+  if (!target) {
+    return;
+  }
+
+  const screenX = centerX + (target.x - player.worldX);
+  const screenY = centerY + (target.y - player.worldY);
+  const halfSize = target.size / 2;
+
+  if (
+    screenX < -target.size ||
+    screenX > canvas.width + target.size ||
+    screenY < -target.size ||
+    screenY > canvas.height + target.size
+  ) {
+    return;
+  }
+
+  ctx.fillStyle = '#ff3b3b';
+  ctx.fillRect(screenX - halfSize, screenY - halfSize, target.size, target.size);
+}
+
+function renderTargetDirectionArrow() {
+  if (!target) {
+    return;
+  }
+
+  const dx = target.x - player.worldX;
+  const dy = target.y - player.worldY;
+  const angle = Math.atan2(dy, dx);
+  const arrowX = canvas.width / 2;
+  const arrowY = 24;
+
+  ctx.save();
+  ctx.translate(arrowX, arrowY);
+  ctx.rotate(angle);
+  ctx.fillStyle = '#ffd447';
+  ctx.beginPath();
+  ctx.moveTo(TARGET_ARROW_SIZE, 0);
+  ctx.lineTo(-TARGET_ARROW_SIZE * 0.7, TARGET_ARROW_SIZE * 0.55);
+  ctx.lineTo(-TARGET_ARROW_SIZE * 0.7, -TARGET_ARROW_SIZE * 0.55);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+
+function renderMissiles(centerX, centerY) {
+  ctx.fillStyle = '#ffb347';
+
+  for (let i = 0; i < missiles.length; i += 1) {
+    const missile = missiles[i];
+    const screenX = centerX + (missile.worldX - player.worldX);
+    const screenY = centerY + (missile.worldY - player.worldY);
+
+    if (screenX < -40 || screenX > canvas.width + 40 || screenY < -40 || screenY > canvas.height + 40) {
+      continue;
+    }
+
+    ctx.beginPath();
+    ctx.arc(screenX, screenY, missile.radius, 0, Math.PI * 2);
+    ctx.fill();
+  }
 }
 
 function renderPlanets(centerX, centerY) {
@@ -189,38 +705,116 @@ function renderPlanets(centerX, centerY) {
     ctx.beginPath();
     ctx.arc(screenX, screenY, planet.radius, 0, Math.PI * 2);
     ctx.fill();
+  }
+}
 
-  function hasPlanetCollision() {
-    const planets = getNearbyPlanets();
+function renderMinimap() {
+  const mapWidth = MINIMAP_WIDTH;
+  const mapHeight = MINIMAP_WIDTH * (canvas.height / canvas.width);
+  const mapX = canvas.width - mapWidth - MINIMAP_MARGIN;
+  const mapY = canvas.height - mapHeight - MINIMAP_MARGIN;
+  const mapCenterX = mapX + mapWidth / 2;
+  const mapCenterY = mapY + mapHeight / 2;
+  const rangeX = MINIMAP_RANGE;
+  const rangeY = MINIMAP_RANGE * (canvas.height / canvas.width);
+  const halfRangeX = rangeX / 2;
+  const halfRangeY = rangeY / 2;
+  const scaleX = mapWidth / rangeX;
+  const scaleY = mapHeight / rangeY;
+  const planets = getNearbyPlanets();
 
-    for (let i = 0; i < planets.length; i += 1) {
-      const planet = planets[i];
-      const dx = planet.x - player.worldX;
-      const dy = planet.y - player.worldY;
-      const collisionDistance = planet.radius + player.radius;
+  ctx.save();
+  ctx.fillStyle = 'rgba(8, 12, 22, 0.78)';
+  ctx.fillRect(mapX, mapY, mapWidth, mapHeight);
+  ctx.strokeStyle = 'rgba(180, 205, 255, 0.9)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(mapX, mapY, mapWidth, mapHeight);
 
-      if (dx * dx + dy * dy <= collisionDistance * collisionDistance) {
-        return true;
-      }
+  ctx.beginPath();
+  ctx.rect(mapX + 1, mapY + 1, mapWidth - 2, mapHeight - 2);
+  ctx.clip();
+
+  for (let i = 0; i < planets.length; i += 1) {
+    const planet = planets[i];
+    const dx = planet.x - player.worldX;
+    const dy = planet.y - player.worldY;
+
+    if (Math.abs(dx) > halfRangeX || Math.abs(dy) > halfRangeY) {
+      continue;
     }
 
-    return false;
+    const px = mapCenterX + dx * scaleX;
+    const py = mapCenterY + dy * scaleY;
+    const dotRadius = Math.max(2, Math.min(5, planet.radius * 0.03));
+
+    ctx.fillStyle = planet.color;
+    ctx.beginPath();
+    ctx.arc(px, py, dotRadius, 0, Math.PI * 2);
+    ctx.fill();
   }
 
-  function resetGame() {
-    player.worldX = 0;
-    player.worldY = 0;
-    player.velocityX = 0;
-    player.velocityY = 0;
-    player.angle = PLAYER_START_ANGLE;
+  if (target) {
+    const targetDx = target.x - player.worldX;
+    const targetDy = target.y - player.worldY;
 
-    input.up = false;
-    input.left = false;
-    input.right = false;
+    if (Math.abs(targetDx) <= halfRangeX && Math.abs(targetDy) <= halfRangeY) {
+      const targetPx = mapCenterX + targetDx * scaleX;
+      const targetPy = mapCenterY + targetDy * scaleY;
+      const targetDotSize = 4;
 
-    initStars();
+      ctx.fillStyle = '#ff3b3b';
+      ctx.fillRect(
+        targetPx - targetDotSize / 2,
+        targetPy - targetDotSize / 2,
+        targetDotSize,
+        targetDotSize
+      );
+    }
   }
+
+  if (target) {
+    const targetDx = target.x - player.worldX;
+    const targetDy = target.y - player.worldY;
+
+    if (Math.abs(targetDx) <= halfRangeX && Math.abs(targetDy) <= halfRangeY) {
+      const targetPx = mapCenterX + targetDx * scaleX;
+      const targetPy = mapCenterY + targetDy * scaleY;
+      const targetDotSize = 4;
+
+      ctx.fillStyle = '#ff3b3b';
+      ctx.fillRect(
+        targetPx - targetDotSize / 2,
+        targetPy - targetDotSize / 2,
+        targetDotSize,
+        targetDotSize
+      );
+    }
   }
+
+  ctx.restore();
+
+  ctx.fillStyle = player.color;
+  ctx.beginPath();
+  ctx.arc(mapCenterX, mapCenterY, 3, 0, Math.PI * 2);
+  ctx.fill();
+
+  const speed = Math.hypot(player.velocityX, player.velocityY);
+  const speedRatio = Math.min(1, speed / player.maxSpeed);
+  const headingLineLength = 7 + speedRatio * 15;
+
+  ctx.strokeStyle = player.markerColor;
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(mapCenterX, mapCenterY);
+  ctx.lineTo(
+    mapCenterX + Math.cos(player.angle) * headingLineLength,
+    mapCenterY + Math.sin(player.angle) * headingLineLength
+  );
+  ctx.stroke();
+
+  ctx.fillStyle = 'rgba(225, 235, 255, 0.95)';
+  ctx.font = '12px monospace';
+  ctx.fillText('MINIMAP', mapX + 6, mapY + 14);
 }
 
 function createStar(layer) {
@@ -277,8 +871,6 @@ function updateStars(deltaTime, playerDeltaX, playerDeltaY) {
 
     for (let i = 0; i < stars.length; i += 1) {
       const star = stars[i];
-
-      // Stars drift downward and shift opposite player movement.
       star.y += layer.speed * deltaTime - playerDeltaY * layer.parallax;
       star.x -= playerDeltaX * layer.parallax;
 
@@ -292,6 +884,10 @@ function update(deltaTime) {
   const previousWorldX = player.worldX;
   const previousWorldY = player.worldY;
 
+  if (boostTimeRemaining > 0) {
+    boostTimeRemaining = Math.max(0, boostTimeRemaining - deltaTime);
+  }
+
   if (input.left) {
     player.angle -= player.rotationSpeed * deltaTime;
   }
@@ -300,11 +896,27 @@ function update(deltaTime) {
   }
 
   if (input.up) {
-    player.velocityX += Math.cos(player.angle) * player.thrust * deltaTime;
-    player.velocityY += Math.sin(player.angle) * player.thrust * deltaTime;
+    const thrustMultiplier = boostTimeRemaining > 0 ? 2 : 1;
+    const thrustAcceleration = player.thrust * thrustMultiplier;
+    player.velocityX += Math.cos(player.angle) * thrustAcceleration * deltaTime;
+    player.velocityY += Math.sin(player.angle) * thrustAcceleration * deltaTime;
   }
 
-  applyPlanetGravity(deltaTime);
+  if (input.up) {
+    startThrustSound();
+  } else {
+    stopThrustSound();
+  }
+
+  if (boostTimeRemaining > 0) {
+    startBoostSound();
+  } else {
+    stopBoostSound();
+  }
+
+  if (boostTimeRemaining <= 0) {
+    applyPlanetGravity(deltaTime);
+  }
 
   const speed = Math.hypot(player.velocityX, player.velocityY);
   if (speed > player.maxSpeed) {
@@ -316,7 +928,17 @@ function update(deltaTime) {
   player.worldX += player.velocityX * deltaTime;
   player.worldY += player.velocityY * deltaTime;
 
+  if (hasPlanetCollision()) {
+    onPlayerPlanetCollision();
+    return;
+  }
+
+  updateMissiles(deltaTime);
   updateStars(deltaTime, player.worldX - previousWorldX, player.worldY - previousWorldY);
+
+  if (!target) {
+    spawnTarget();
+  }
 }
 
 function render() {
@@ -325,11 +947,9 @@ function render() {
   const centerX = canvas.width / 2;
   const centerY = canvas.height / 2;
 
-  // Background.
   ctx.fillStyle = '#05070c';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-  // Star field.
   starLayers.forEach((layer, layerIndex) => {
     const stars = starsByLayer[layerIndex];
 
@@ -344,10 +964,12 @@ function render() {
   });
   ctx.globalAlpha = 1;
 
-  // Planets in world space.
   renderPlanets(centerX, centerY);
+  renderTarget(centerX, centerY);
+  renderMissiles(centerX, centerY);
+  renderTargetDirectionArrow();
+  renderMinimap();
 
-  // Player ship stays centered while the world moves around it.
   const noseDistance = player.radius * 1.28;
   const rearDistance = player.radius * 0.68;
   const wingOffset = player.radius * 0.36;
@@ -361,10 +983,6 @@ function render() {
     Math.cos(player.angle + Math.PI / 2) * wingOffset;
   const leftY =
     centerY +
-    if (hasPlanetCollision()) {
-      resetGame();
-      return;
-    }
     Math.sin(player.angle + (Math.PI * 3) / 4) * rearDistance +
     Math.sin(player.angle + Math.PI / 2) * wingOffset;
 
@@ -412,18 +1030,41 @@ function render() {
   ctx.closePath();
   ctx.fill();
 
-  // Marker speck on the looking corner (nose).
   ctx.fillStyle = player.markerColor;
   ctx.beginPath();
   ctx.arc(noseX, noseY, 3, 0, Math.PI * 2);
   ctx.fill();
 
-  // Lightweight HUD.
+  if (boostTimeRemaining > 0) {
+    const boostRatio = boostTimeRemaining / BOOST_DURATION;
+    const pulse = 0.75 + 0.25 * Math.sin(performance.now() * 0.02);
+    const edgeAlpha = Math.min(0.42, 0.2 + boostRatio * 0.22 * pulse);
+    const innerRadius = Math.min(canvas.width, canvas.height) * 0.1;
+    const outerRadius = Math.hypot(canvas.width, canvas.height) * 0.62;
+    const vignette = ctx.createRadialGradient(centerX, centerY, innerRadius, centerX, centerY, outerRadius);
+
+    vignette.addColorStop(0, 'rgba(255, 255, 255, 0)');
+    vignette.addColorStop(0.5, 'rgba(255, 255, 255, 0)');
+    vignette.addColorStop(1, `rgba(255, 255, 255, ${edgeAlpha})`);
+
+    ctx.fillStyle = vignette;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+  }
+
   const speed = Math.hypot(player.velocityX, player.velocityY);
+  ctx.save();
   ctx.fillStyle = '#f0f0f0';
   ctx.font = '16px monospace';
-  ctx.fillText('Up: Thrust | Left/Right: Rotate', 16, 28);
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillText('Up: Thrust | Left/Right: Rotate | C: Boost', 16, 28);
   ctx.fillText(`Speed: ${speed.toFixed(1)}`, 16, 50);
+
+  ctx.textAlign = 'right';
+  ctx.fillText(`Lives: ${lives}`, canvas.width - 16, 28);
+  ctx.fillText(`Targets destroyed: ${destroyedTargets}`, canvas.width - 16, 50);
+  ctx.fillText(`Boost: ${boostCharges}/${BOOST_MAX_CHARGES}`, canvas.width - 16, 72);
+  ctx.restore();
 }
 
 function gameLoop(timestamp) {
@@ -447,6 +1088,15 @@ function setKeyState(code, isPressed) {
 }
 
 window.addEventListener('keydown', (event) => {
+  ensureAudioContext();
+
+  if (event.code === 'Space' && !event.repeat) {
+    shootMissile();
+  }
+  if (event.code === 'KeyC' && !event.repeat) {
+    activateBoost();
+  }
+
   setKeyState(event.code, true);
 });
 
@@ -456,6 +1106,7 @@ window.addEventListener('keyup', (event) => {
 
 window.addEventListener('resize', resizeCanvas);
 resizeCanvas();
+spawnTarget();
 requestAnimationFrame((timestamp) => {
   lastTime = timestamp;
   gameLoop(timestamp);
