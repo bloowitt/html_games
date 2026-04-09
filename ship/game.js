@@ -11,7 +11,58 @@ const input = {
   right: false,
 };
 
+const keyboardInput = {
+  up: false,
+  left: false,
+  right: false,
+};
+
+const mobileInput = {
+  up: false,
+  left: false,
+  right: false,
+};
+
 const isCoarsePointer = window.matchMedia('(pointer: coarse)').matches;
+const activeTouchSides = new Map();
+const touchPointerMeta = new Map();
+
+let motionPermissionRequestInFlight = false;
+let motionEnabled = false;
+let previousMotion = null;
+let lastShakeTime = 0;
+
+const SHAKE_DELTA_THRESHOLD = 19;
+const SHAKE_COOLDOWN_MS = 1200;
+const SHOOT_TAP_MAX_DURATION_MS = 220;
+const SHOOT_TAP_MAX_MOVE_PX = 20;
+
+function syncInputState() {
+  input.up = keyboardInput.up || mobileInput.up;
+  input.left = keyboardInput.left || mobileInput.left;
+  input.right = keyboardInput.right || mobileInput.right;
+}
+
+function updateMobileDirectionalInput() {
+  const leftActive = Array.from(activeTouchSides.values()).some((side) => side === 'left');
+  const rightActive = Array.from(activeTouchSides.values()).some((side) => side === 'right');
+
+  if (leftActive && rightActive) {
+    mobileInput.left = false;
+    mobileInput.right = false;
+    mobileInput.up = true;
+  } else {
+    mobileInput.left = leftActive;
+    mobileInput.right = rightActive;
+    mobileInput.up = false;
+  }
+
+  syncInputState();
+}
+
+function classifyScreenSide(clientX) {
+  return clientX < window.innerWidth / 2 ? 'left' : 'right';
+}
 
 const PLAYER_START_ANGLE = -Math.PI / 2;
 
@@ -461,6 +512,13 @@ function resetPlayerState() {
   input.up = false;
   input.left = false;
   input.right = false;
+  keyboardInput.up = false;
+  keyboardInput.left = false;
+  keyboardInput.right = false;
+  mobileInput.up = false;
+  mobileInput.left = false;
+  mobileInput.right = false;
+  activeTouchSides.clear();
   boostTimeRemaining = 0;
 
   stopThrustSound();
@@ -711,9 +769,21 @@ function renderPlanets(centerX, centerY) {
 }
 
 function renderMinimap() {
-  const compactMap = canvas.width < 720;
-  const mapWidth = compactMap ? Math.min(180, canvas.width * 0.36) : MINIMAP_WIDTH;
-  const mapHeight = mapWidth * (canvas.height / canvas.width);
+  const baseMapWidth = MINIMAP_WIDTH;
+  const baseMapHeight = baseMapWidth * (canvas.height / canvas.width);
+  const longestScreenSide = Math.max(canvas.width, canvas.height);
+  const shortestScreenSide = Math.min(canvas.width, canvas.height);
+  const maxByLongestSide = longestScreenSide * 0.2;
+  const maxByShortestSide = shortestScreenSide * 0.15;
+
+  const longestMapSide = Math.max(baseMapWidth, baseMapHeight);
+  const shortestMapSide = Math.min(baseMapWidth, baseMapHeight);
+  const scaleByLongest = maxByLongestSide / longestMapSide;
+  const scaleByShortest = maxByShortestSide / shortestMapSide;
+  const mapScale = Math.min(1, scaleByLongest, scaleByShortest);
+
+  const mapWidth = baseMapWidth * mapScale;
+  const mapHeight = baseMapHeight * mapScale;
   const mapX = canvas.width - mapWidth - MINIMAP_MARGIN;
   const mapY = canvas.height - mapHeight - MINIMAP_MARGIN;
   const mapCenterX = mapX + mapWidth / 2;
@@ -816,7 +886,7 @@ function renderMinimap() {
   ctx.stroke();
 
   ctx.fillStyle = 'rgba(225, 235, 255, 0.95)';
-  ctx.font = compactMap ? '10px monospace' : '12px monospace';
+  ctx.font = mapScale < 1 ? '10px monospace' : '12px monospace';
   ctx.fillText('MINIMAP', mapX + 6, mapY + 14);
 }
 
@@ -1062,7 +1132,7 @@ function render() {
   ctx.textAlign = 'left';
   ctx.textBaseline = 'alphabetic';
   const controlsLabel = isCoarsePointer
-    ? 'Touch: Thrust/Left/Right/Shoot/Boost'
+    ? 'Touch: Left=Left | Right=Right | Both=Thrust | Tap=Shoot | Shake=Boost'
     : 'Up: Thrust | Left/Right: Rotate | C: Boost | Space: Shoot';
   ctx.fillText(controlsLabel, 16, compactHud ? 24 : 28);
   ctx.fillText(`Speed: ${speed.toFixed(1)}`, 16, compactHud ? 44 : 50);
@@ -1086,87 +1156,147 @@ function gameLoop(timestamp) {
 
 function setKeyState(code, isPressed) {
   if (code === 'ArrowUp' || code === 'KeyW') {
-    input.up = isPressed;
+    keyboardInput.up = isPressed;
   } else if (code === 'ArrowLeft' || code === 'KeyA') {
-    input.left = isPressed;
+    keyboardInput.left = isPressed;
   } else if (code === 'ArrowRight' || code === 'KeyD') {
-    input.right = isPressed;
+    keyboardInput.right = isPressed;
   }
+
+  syncInputState();
 }
 
-function bindTouchControls() {
-  const controls = document.querySelector('.touch-controls');
-  if (!controls) {
+function enableMotionListener() {
+  if (motionEnabled || typeof window.DeviceMotionEvent === 'undefined') {
     return;
   }
 
-  const activePointers = new Map();
-
-  function setActionState(action, isPressed) {
-    if (action === 'up') {
-      input.up = isPressed;
-    } else if (action === 'left') {
-      input.left = isPressed;
-    } else if (action === 'right') {
-      input.right = isPressed;
-    }
-  }
-
-  function beginAction(button, pointerId) {
-    const action = button.dataset.action;
-    if (!action) {
+  window.addEventListener('devicemotion', (event) => {
+    const acceleration = event.accelerationIncludingGravity;
+    if (!acceleration) {
       return;
     }
 
-    ensureAudioContext();
-    activePointers.set(pointerId, action);
-    button.classList.add('is-active');
+    const ax = acceleration.x ?? 0;
+    const ay = acceleration.y ?? 0;
+    const az = acceleration.z ?? 0;
 
-    if (action === 'shoot') {
-      shootMissile();
-      return;
+    if (previousMotion) {
+      const deltaX = ax - previousMotion.x;
+      const deltaY = ay - previousMotion.y;
+      const deltaZ = az - previousMotion.z;
+      const delta = Math.hypot(deltaX, deltaY, deltaZ);
+      const now = performance.now();
+
+      if (delta >= SHAKE_DELTA_THRESHOLD && now - lastShakeTime >= SHAKE_COOLDOWN_MS) {
+        activateBoost();
+        lastShakeTime = now;
+      }
     }
 
-    if (action === 'boost') {
-      activateBoost();
-      return;
-    }
-
-    setActionState(action, true);
-  }
-
-  function endAction(button, pointerId) {
-    const action = activePointers.get(pointerId);
-    if (!action) {
-      return;
-    }
-
-    activePointers.delete(pointerId);
-    button.classList.remove('is-active');
-    setActionState(action, false);
-  }
-
-  const buttons = controls.querySelectorAll('[data-action]');
-  buttons.forEach((button) => {
-    button.addEventListener('pointerdown', (event) => {
-      event.preventDefault();
-      button.setPointerCapture(event.pointerId);
-      beginAction(button, event.pointerId);
-    });
-
-    button.addEventListener('pointerup', (event) => {
-      event.preventDefault();
-      endAction(button, event.pointerId);
-    });
-
-    button.addEventListener('pointercancel', (event) => {
-      endAction(button, event.pointerId);
-    });
-
-    button.addEventListener('lostpointercapture', (event) => {
-      endAction(button, event.pointerId);
-    });
+    previousMotion = { x: ax, y: ay, z: az };
   });
+
+  motionEnabled = true;
+}
+
+function requestMotionPermissionIfNeeded() {
+  if (
+    !isCoarsePointer ||
+    motionEnabled ||
+    motionPermissionRequestInFlight ||
+    typeof window.DeviceMotionEvent === 'undefined'
+  ) {
+    return;
+  }
+
+  if (typeof window.DeviceMotionEvent.requestPermission === 'function') {
+    motionPermissionRequestInFlight = true;
+    window.DeviceMotionEvent.requestPermission()
+      .then((permissionState) => {
+        if (permissionState === 'granted') {
+          enableMotionListener();
+        }
+      })
+      .catch(() => {
+        // Ignore permission errors; desktop browsers and some devices do not support this API.
+      })
+      .finally(() => {
+        motionPermissionRequestInFlight = false;
+      });
+    return;
+  }
+
+  enableMotionListener();
+}
+
+function bindTouchScreenZones() {
+  if (!isCoarsePointer) {
+    return;
+  }
+
+  function onPointerDown(event) {
+    requestMotionPermissionIfNeeded();
+    ensureAudioContext();
+    const side = classifyScreenSide(event.clientX);
+    activeTouchSides.set(event.pointerId, side);
+    touchPointerMeta.set(event.pointerId, {
+      startX: event.clientX,
+      startY: event.clientY,
+      startTime: performance.now(),
+      moved: false,
+    });
+    updateMobileDirectionalInput();
+  }
+
+  function onPointerMove(event) {
+    const meta = touchPointerMeta.get(event.pointerId);
+    if (!meta || meta.moved) {
+      return;
+    }
+
+    const movedDistance = Math.hypot(event.clientX - meta.startX, event.clientY - meta.startY);
+    if (movedDistance > SHOOT_TAP_MAX_MOVE_PX) {
+      meta.moved = true;
+    }
+  }
+
+  function onPointerEnd(event) {
+    const meta = touchPointerMeta.get(event.pointerId);
+
+    if (!activeTouchSides.has(event.pointerId)) {
+      touchPointerMeta.delete(event.pointerId);
+      return;
+    }
+
+    activeTouchSides.delete(event.pointerId);
+    updateMobileDirectionalInput();
+
+    if (meta) {
+      const touchDuration = performance.now() - meta.startTime;
+      if (touchDuration <= SHOOT_TAP_MAX_DURATION_MS && !meta.moved) {
+        shootMissile();
+      }
+    }
+
+    touchPointerMeta.delete(event.pointerId);
+  }
+
+  window.addEventListener('pointerdown', onPointerDown, { passive: true });
+  window.addEventListener('pointermove', onPointerMove, { passive: true });
+  window.addEventListener('pointerup', onPointerEnd, { passive: true });
+  window.addEventListener('pointercancel', onPointerEnd, { passive: true });
+
+  // If the pointer leaves the page unexpectedly, clear its side assignment.
+  window.addEventListener(
+    'pointerout',
+    (event) => {
+      if (event.relatedTarget === null) {
+        onPointerEnd(event);
+      }
+    },
+    { passive: true }
+  );
 }
 
 window.addEventListener('keydown', (event) => {
@@ -1179,6 +1309,8 @@ window.addEventListener('keydown', (event) => {
     activateBoost();
   }
 
+  requestMotionPermissionIfNeeded();
+
   setKeyState(event.code, true);
 });
 
@@ -1188,7 +1320,7 @@ window.addEventListener('keyup', (event) => {
 
 window.addEventListener('resize', resizeCanvas);
 resizeCanvas();
-bindTouchControls();
+bindTouchScreenZones();
 spawnTarget();
 requestAnimationFrame((timestamp) => {
   lastTime = timestamp;
