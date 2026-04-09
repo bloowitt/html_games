@@ -12,6 +12,9 @@
         height: 100%;
         overflow: hidden;
         background: #111;
+        touch-action: none;
+        -webkit-user-select: none;
+        user-select: none;
       }
 
       canvas {
@@ -19,10 +22,107 @@
         width: 100vw;
         height: 100vh;
       }
+
+      .touch-controls {
+        position: fixed;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        display: none;
+        justify-content: space-between;
+        align-items: flex-end;
+        padding: 12px;
+        padding-bottom: calc(12px + env(safe-area-inset-bottom));
+        pointer-events: none;
+        z-index: 10;
+      }
+
+      .touch-controls__group {
+        display: flex;
+        gap: 10px;
+        pointer-events: auto;
+      }
+
+      .touch-controls__button {
+        width: 68px;
+        height: 68px;
+        border: 1px solid rgba(210, 235, 255, 0.55);
+        border-radius: 14px;
+        background: rgba(12, 22, 38, 0.62);
+        color: #f4f8ff;
+        font-family: monospace;
+        font-size: 13px;
+        touch-action: none;
+        backdrop-filter: blur(6px);
+        -webkit-backdrop-filter: blur(6px);
+      }
+
+      .touch-controls__button:active,
+      .touch-controls__button.is-active {
+        background: rgba(97, 218, 251, 0.5);
+      }
+
+      .touch-controls__button--wide {
+        width: 84px;
+      }
+
+      @media (pointer: coarse) {
+        .touch-controls {
+          display: flex;
+        }
+      }
+
+      @media (max-width: 420px) {
+        .touch-controls__button {
+          width: 60px;
+          height: 60px;
+          font-size: 12px;
+        }
+
+        .touch-controls__button--wide {
+          width: 74px;
+        }
+      }
     </style>
   </head>
   <body>
     <canvas id="gameCanvas"></canvas>
+    <div class="touch-controls" aria-label="Touch controls">
+      <div class="touch-controls__group">
+        <button class="touch-controls__button" type="button" data-action="left" aria-label="Rotate left">
+          Left
+        </button>
+        <button class="touch-controls__button" type="button" data-action="right" aria-label="Rotate right">
+          Right
+        </button>
+      </div>
+      <div class="touch-controls__group">
+        <button
+          class="touch-controls__button touch-controls__button--wide"
+          type="button"
+          data-action="shoot"
+          aria-label="Shoot"
+        >
+          Shoot
+        </button>
+        <button
+          class="touch-controls__button touch-controls__button--wide"
+          type="button"
+          data-action="boost"
+          aria-label="Boost"
+        >
+          Boost
+        </button>
+        <button
+          class="touch-controls__button touch-controls__button--wide"
+          type="button"
+          data-action="up"
+          aria-label="Thrust"
+        >
+          Thrust
+        </button>
+      </div>
+    </div>
     <script src="./game.js"></script>
   </body>
 </html>

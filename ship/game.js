@@ -11,6 +11,8 @@ const input = {
   right: false,
 };
 
+const isCoarsePointer = window.matchMedia('(pointer: coarse)').matches;
+
 const PLAYER_START_ANGLE = -Math.PI / 2;
 
 const player = {
@@ -709,8 +711,9 @@ function renderPlanets(centerX, centerY) {
 }
 
 function renderMinimap() {
-  const mapWidth = MINIMAP_WIDTH;
-  const mapHeight = MINIMAP_WIDTH * (canvas.height / canvas.width);
+  const compactMap = canvas.width < 720;
+  const mapWidth = compactMap ? Math.min(180, canvas.width * 0.36) : MINIMAP_WIDTH;
+  const mapHeight = mapWidth * (canvas.height / canvas.width);
   const mapX = canvas.width - mapWidth - MINIMAP_MARGIN;
   const mapY = canvas.height - mapHeight - MINIMAP_MARGIN;
   const mapCenterX = mapX + mapWidth / 2;
@@ -813,7 +816,7 @@ function renderMinimap() {
   ctx.stroke();
 
   ctx.fillStyle = 'rgba(225, 235, 255, 0.95)';
-  ctx.font = '12px monospace';
+  ctx.font = compactMap ? '10px monospace' : '12px monospace';
   ctx.fillText('MINIMAP', mapX + 6, mapY + 14);
 }
 
@@ -1052,18 +1055,22 @@ function render() {
   }
 
   const speed = Math.hypot(player.velocityX, player.velocityY);
+  const compactHud = canvas.width < 720;
   ctx.save();
   ctx.fillStyle = '#f0f0f0';
-  ctx.font = '16px monospace';
+  ctx.font = compactHud ? '13px monospace' : '16px monospace';
   ctx.textAlign = 'left';
   ctx.textBaseline = 'alphabetic';
-  ctx.fillText('Up: Thrust | Left/Right: Rotate | C: Boost', 16, 28);
-  ctx.fillText(`Speed: ${speed.toFixed(1)}`, 16, 50);
+  const controlsLabel = isCoarsePointer
+    ? 'Touch: Thrust/Left/Right/Shoot/Boost'
+    : 'Up: Thrust | Left/Right: Rotate | C: Boost | Space: Shoot';
+  ctx.fillText(controlsLabel, 16, compactHud ? 24 : 28);
+  ctx.fillText(`Speed: ${speed.toFixed(1)}`, 16, compactHud ? 44 : 50);
 
   ctx.textAlign = 'right';
-  ctx.fillText(`Lives: ${lives}`, canvas.width - 16, 28);
-  ctx.fillText(`Targets destroyed: ${destroyedTargets}`, canvas.width - 16, 50);
-  ctx.fillText(`Boost: ${boostCharges}/${BOOST_MAX_CHARGES}`, canvas.width - 16, 72);
+  ctx.fillText(`Lives: ${lives}`, canvas.width - 16, compactHud ? 24 : 28);
+  ctx.fillText(`Targets destroyed: ${destroyedTargets}`, canvas.width - 16, compactHud ? 44 : 50);
+  ctx.fillText(`Boost: ${boostCharges}/${BOOST_MAX_CHARGES}`, canvas.width - 16, compactHud ? 64 : 72);
   ctx.restore();
 }
 
@@ -1087,6 +1094,81 @@ function setKeyState(code, isPressed) {
   }
 }
 
+function bindTouchControls() {
+  const controls = document.querySelector('.touch-controls');
+  if (!controls) {
+    return;
+  }
+
+  const activePointers = new Map();
+
+  function setActionState(action, isPressed) {
+    if (action === 'up') {
+      input.up = isPressed;
+    } else if (action === 'left') {
+      input.left = isPressed;
+    } else if (action === 'right') {
+      input.right = isPressed;
+    }
+  }
+
+  function beginAction(button, pointerId) {
+    const action = button.dataset.action;
+    if (!action) {
+      return;
+    }
+
+    ensureAudioContext();
+    activePointers.set(pointerId, action);
+    button.classList.add('is-active');
+
+    if (action === 'shoot') {
+      shootMissile();
+      return;
+    }
+
+    if (action === 'boost') {
+      activateBoost();
+      return;
+    }
+
+    setActionState(action, true);
+  }
+
+  function endAction(button, pointerId) {
+    const action = activePointers.get(pointerId);
+    if (!action) {
+      return;
+    }
+
+    activePointers.delete(pointerId);
+    button.classList.remove('is-active');
+    setActionState(action, false);
+  }
+
+  const buttons = controls.querySelectorAll('[data-action]');
+  buttons.forEach((button) => {
+    button.addEventListener('pointerdown', (event) => {
+      event.preventDefault();
+      button.setPointerCapture(event.pointerId);
+      beginAction(button, event.pointerId);
+    });
+
+    button.addEventListener('pointerup', (event) => {
+      event.preventDefault();
+      endAction(button, event.pointerId);
+    });
+
+    button.addEventListener('pointercancel', (event) => {
+      endAction(button, event.pointerId);
+    });
+
+    button.addEventListener('lostpointercapture', (event) => {
+      endAction(button, event.pointerId);
+    });
+  });
+}
+
 window.addEventListener('keydown', (event) => {
   ensureAudioContext();
 
@@ -1106,6 +1188,7 @@ window.addEventListener('keyup', (event) => {
 
 window.addEventListener('resize', resizeCanvas);
 resizeCanvas();
+bindTouchControls();
 spawnTarget();
 requestAnimationFrame((timestamp) => {
   lastTime = timestamp;
